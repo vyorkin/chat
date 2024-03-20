@@ -1,0 +1,28 @@
+[package]
+name = "chat"
+version = "0.1.0"
+edition = "2021"
+
+[profile.dev.package.backtrace]
+opt-level = 3
+
+[lib]
+name = "chat"
+path = "src/lib.rs"
+
+[[bin]]
+name = "server"
+path = "bin/server.rs"
+
+[[bin]]
+name = "client"
+path = "bin/client.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full", "tracing"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+thiserror = "1.0"
+color-eyre = "0.6"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+console-subscriber = "0.2"
