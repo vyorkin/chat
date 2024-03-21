@@ -50,6 +50,9 @@ async fn run<A: ToSocketAddrs, S: Future>(address: A, shutdown: S) -> std::io::R
                 error!(cause = %err, "broker failure");
             }
         },
+        _ = shutdown_rx.recv() => {
+            info!("peer initiated shutdown");
+        }
         _ = shutdown => {
             info!("shutting down");
         }

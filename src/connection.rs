@@ -4,6 +4,7 @@ use tokio::{
     net::tcp::OwnedReadHalf,
 };
 
+/// Reads `Event`'s  from a remote peer with buffering.
 #[derive(Debug)]
 pub struct Connection {
     lines: Lines<BufReader<OwnedReadHalf>>,

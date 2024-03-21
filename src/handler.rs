@@ -1,5 +1,5 @@
 use crate::{connection::Connection, ChatError, Event, EventSender, Shutdown};
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::{net::tcp::OwnedWriteHalf, select};
 use tracing::instrument;
 
 /// Per-connection handler.
@@ -27,6 +27,7 @@ impl Handler {
         socket_writer: OwnedWriteHalf,
         event_sender: EventSender,
     ) -> Result<(), ChatError> {
+        // Read peer's name first.
         let name = self.connection.read_name().await?;
 
         event_sender.send(Event::NewPeer {
@@ -34,7 +35,22 @@ impl Handler {
             socket_writer,
         })?;
 
-        while let Some(event) = self.connection.read_event(name.clone()).await? {
+        // As long as the shutdown signal has not been received, try to read next event.
+        while !self.shutdown.is_shutdown() {
+            let maybe_event = select! {
+                res = self.connection.read_event(name.clone()) => res?,
+                _ = self.shutdown.recv() => {
+                    // If a shutdown signal is received, return from `run`.
+                    // This will result in the task termination.
+                    return Ok(());
+                }
+            };
+
+            let event = match maybe_event {
+                Some(event) => event,
+                None => return Ok(()),
+            };
+
             event_sender.send(event)?;
         }
 
