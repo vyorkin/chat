@@ -1,201 +1,77 @@
-use chat::{telemetry, ChatError};
-use color_eyre::eyre::Result;
-use std::{collections::HashMap, future::Future, net::SocketAddr};
+use chat::{telemetry, Broker, Event, Listener};
+use clap::{Parser, Subcommand};
+use color_eyre::eyre;
+use std::future::Future;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{tcp::OwnedWriteHalf, TcpListener, TcpStream, ToSocketAddrs},
-    select,
-    sync::mpsc,
-    task::JoinHandle,
+    net::{TcpListener, ToSocketAddrs},
+    select, signal,
+    sync::{broadcast, mpsc},
 };
 use tracing::{error, info, instrument};
 
-enum Event {
-    NewPeer {
-        name: String,
-        stream: OwnedWriteHalf,
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    Start {
+        #[arg(short, long)]
+        port: Option<u16>,
     },
-    BroadcastMessage {
-        from: String,
-        text: String,
-    },
-    PeerMessage {
-        from: String,
-        to: Vec<String>,
-        text: String,
-    },
-    Shutdown,
 }
 
-type Sender<T> = mpsc::UnboundedSender<T>;
-type Receiver<T> = mpsc::UnboundedReceiver<T>;
+#[instrument(skip(address, shutdown))]
+async fn run<A: ToSocketAddrs, S: Future>(address: A, shutdown: S) -> std::io::Result<()> {
+    let (notify_shutdown, _) = broadcast::channel::<()>(1);
 
-type EventSender = Sender<Event>;
-type EventReceiver = Receiver<Event>;
-
-type MessageSender = Sender<String>;
-type MessageReceiver = Receiver<String>;
-
-#[instrument(name = "Processing connection", skip(socket, events))]
-pub async fn process_connection(
-    socket: TcpStream,
-    address: SocketAddr,
-    events: EventSender,
-) -> Result<()> {
-    let (socket_reader, socket_writer) = socket.into_split();
-
-    let reader = BufReader::new(socket_reader);
-    let mut lines = reader.lines();
-
-    let name = match lines.next_line().await? {
-        Some(line) => Ok(line),
-        None => Err(ChatError::PeerDisconnectedError),
-    }?;
-
-    info!("<- {name} joined");
-    events.send(Event::NewPeer {
-        name: name.clone(),
-        stream: socket_writer,
-    })?;
-
-    while let Some(line) = lines.next_line().await? {
-        info!("line: {}", line);
-
-        if line.trim() == "shutdown" {
-            info!("Shutdown requested");
-            events.send(Event::Shutdown)?;
-            continue;
-        }
-
-        let (receivers, text) = match line.split_once(':') {
-            Some((receivers, text)) => (Some(receivers), text.trim()),
-            None => (None, line.trim()),
-        };
-        let text = text.to_owned();
-        match receivers {
-            Some(receivers) => {
-                let receivers: Vec<String> =
-                    receivers.split(',').map(|s| s.trim().to_owned()).collect();
-
-                info!(
-                    "PeerMessage: {} -> {}: {}",
-                    name,
-                    receivers.join(", "),
-                    text
-                );
-                events.send(Event::PeerMessage {
-                    from: name.clone(),
-                    to: receivers,
-                    text,
-                })?;
-            }
-            None => {
-                info!("BroadcastMessage: {}: {}", name, text);
-                events.send(Event::BroadcastMessage {
-                    from: name.clone(),
-                    text,
-                })?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[instrument(name = "Processing events", skip(events, shutdown))]
-pub async fn process_events(mut events: EventReceiver, shutdown: Sender<()>) -> Result<()> {
-    use std::collections::hash_map::Entry;
-
-    let mut peers: HashMap<String, MessageSender> = HashMap::new();
-
-    while let Some(event) = events.recv().await {
-        match event {
-            Event::NewPeer { name, stream } => match peers.entry(name) {
-                Entry::Occupied(_) => (),
-                Entry::Vacant(entry) => {
-                    let (message_tx, message_rx) = mpsc::unbounded_channel();
-                    entry.insert(message_tx);
-                    spawn(process_messages(stream, message_rx));
-                }
-            },
-            Event::PeerMessage { from, to, text } => {
-                for receiver in to {
-                    if let Some(peer) = peers.get_mut(&receiver) {
-                        let message = format!("{}: {}\n", from, text);
-                        peer.send(message)?;
-                    }
-                }
-            }
-            Event::BroadcastMessage { from, text } => {
-                for peer in peers.values() {
-                    let message = format!("{}: {}\n", from, text);
-                    peer.send(message)?;
-                }
-            }
-            Event::Shutdown => {
-                info!("Sending shutdown message to channel");
-                shutdown.send(())?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[instrument(name = "Processing messages")]
-pub async fn process_messages(
-    mut socket_writer: OwnedWriteHalf,
-    mut messages: MessageReceiver,
-) -> Result<()> {
-    while let Some(message) = messages.recv().await {
-        socket_writer.write_all(message.as_bytes()).await?;
-    }
-
-    Ok(())
-}
-
-#[instrument(name = "Listening", skip(address))]
-async fn listen<A: ToSocketAddrs>(address: A) -> std::io::Result<()> {
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
-    let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
+    let (event_sender, event_receiver) = mpsc::unbounded_channel::<Event>();
 
-    let listener = TcpListener::bind(address).await?;
-    spawn(process_events(event_rx, shutdown_tx));
+    let tcp_listener = TcpListener::bind(address).await?;
+    let mut listener = Listener::new(tcp_listener, notify_shutdown);
+    let mut broker = Broker::new(event_receiver, shutdown_tx);
 
-    loop {
-        select! {
-            Ok((socket, socket_addr)) = listener.accept() => {
-                spawn(process_connection(socket, socket_addr, event_tx.clone()));
-            },
-            _ = tokio::signal::ctrl_c() => {
-                info!("Got CTRL+C");
-                break;
-            },
-            Some(()) = shutdown_rx.recv() => {
-                info!("Shutdown acknowledged");
-                break;
+    // Concurrently wait on listener and shutdown signal.
+    // The listener can only complete if an error is encountered.
+    // So under normal circumstances, this `select!` statement
+    // completes when shutdown signal is received.
+    select! {
+        res = listener.run(event_sender) => {
+            if let Err(err) = res {
+                error!(cause = %err, "listener failure");
             }
+        },
+        res = broker.run() => {
+            if let Err(err) = res {
+                error!(cause = %err, "broker failure");
+            }
+        },
+        _ = shutdown => {
+            info!("shutting down");
         }
     }
 
     Ok(())
-}
-
-fn spawn<F>(future: F) -> JoinHandle<()>
-where
-    F: Future<Output = Result<()>> + Send + 'static,
-{
-    tokio::spawn(async move {
-        if let Err(e) = future.await {
-            error!("{}", e)
-        }
-    })
 }
 
 #[tokio::main]
-pub async fn main() -> Result<()> {
+pub async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
     telemetry::setup("info")?;
-    listen("127.0.0.1:6969").await?;
+
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Start { port } => {
+            let port = port.unwrap_or(6969);
+            let address = format!("127.0.0.1:{}", port);
+
+            run(address, signal::ctrl_c()).await?;
+        }
+    }
+
     Ok(())
 }
