@@ -51,19 +51,19 @@ impl Broker {
                     );
                     for receiver in to {
                         if let Some(peer) = self.peers.get_mut(&receiver) {
-                            peer.send(format!("{}\n", message))?;
+                            let _ = peer.send(format!("{}\n", message));
                         }
                     }
                 }
                 Event::BroadcastMessage(message) => {
                     info!("[broadcast] {}", message.to_string());
                     for peer in self.peers.values() {
-                        peer.send(format!("{}\n", message))?;
+                        let _ = peer.send(format!("{}\n", message));
                     }
                 }
                 Event::Shutdown => {
                     info!("shutdown requested");
-                    self.shutdown.send(())?;
+                    let _ = self.shutdown.send(());
                 }
             }
         }

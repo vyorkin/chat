@@ -30,10 +30,10 @@ impl Handler {
         // Read peer's name first.
         let name = self.connection.read_name().await?;
 
-        event_sender.send(Event::NewPeer {
+        let _ = event_sender.send(Event::NewPeer {
             name: name.clone(),
             socket_writer,
-        })?;
+        });
 
         // As long as the shutdown signal has not been received, try to read next event.
         while !self.shutdown.is_shutdown() {
@@ -51,7 +51,7 @@ impl Handler {
                 None => return Ok(()),
             };
 
-            event_sender.send(event)?;
+            let _ = event_sender.send(event);
         }
 
         Ok(())
